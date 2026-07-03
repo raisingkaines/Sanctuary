@@ -1,10 +1,7 @@
-﻿using System;
-
+using System;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-
 using Sanctuary.Core.IO;
-using Sanctuary.Packet;
 using Sanctuary.Packet.Common.Attributes;
 
 namespace Sanctuary.Gateway.Handlers;
@@ -12,26 +9,25 @@ namespace Sanctuary.Gateway.Handlers;
 [PacketHandler]
 public static class BaseLobbyGameDefinitionPacketHandler
 {
-    private static ILogger _logger = null!;
+	private static ILogger _logger;
 
-    public static void ConfigureServices(IServiceProvider serviceProvider)
-    {
-        var loggerFactory = serviceProvider.GetRequiredService<ILoggerFactory>();
-        _logger = loggerFactory.CreateLogger(nameof(BaseLobbyGameDefinitionPacketHandler));
-    }
+	public static void ConfigureServices(IServiceProvider serviceProvider)
+	{
+		_logger = serviceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("BaseLobbyGameDefinitionPacketHandler");
+	}
 
-    public static bool HandlePacket(GatewayConnection connection, PacketReader reader)
-    {
-        if (!reader.TryRead(out short opCode))
-        {
-            _logger.LogError("Failed to read opcode from packet. ( Data: {data} )", Convert.ToHexString(reader.Span));
-            return false;
-        }
-
-        return opCode switch
-        {
-            LobbyGameDefinitionPacketDefinitionsRequest.OpCode => LobbyGameDefinitionPacketDefinitionsRequestHandler.HandlePacket(connection),
-            _ => false
-        };
-    }
+	public static bool HandlePacket(GatewayConnection connection, PacketReader reader, bool worldTunnel)
+	{
+		if (!reader.TryRead(out short result))
+		{
+			_logger.LogError("Failed to read opcode from packet. ( Data: {data} )", Convert.ToHexString(reader.Span));
+			return false;
+		}
+		if (result == 1)
+		{
+			return LobbyGameDefinitionPacketDefinitionsRequestHandler.HandlePacket(connection, worldTunnel);
+		}
+		_logger.LogInformation("Unhandled lobby game definition packet. Type={type}, Player={player}, WorldTunnel={worldTunnel}", result, connection.Player?.Guid ?? 0, worldTunnel);
+		return false;
+	}
 }

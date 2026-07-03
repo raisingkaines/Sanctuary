@@ -1,10 +1,7 @@
-﻿using System;
-
+using System;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-
 using Sanctuary.Game;
-using Sanctuary.Packet;
 using Sanctuary.Packet.Common.Attributes;
 
 namespace Sanctuary.Gateway.Handlers;
@@ -12,23 +9,22 @@ namespace Sanctuary.Gateway.Handlers;
 [PacketHandler]
 public static class PacketClientIsReadyHandler
 {
-    private static ILogger _logger = null!;
-    private static IResourceManager _resourceManager = null!;
+	private static ILogger _logger;
 
-    public static void ConfigureServices(IServiceProvider serviceProvider)
-    {
-        var loggerFactory = serviceProvider.GetRequiredService<ILoggerFactory>();
-        _logger = loggerFactory.CreateLogger(nameof(PacketClientIsReadyHandler));
+	private static IResourceManager _resourceManager;
 
-        _resourceManager = serviceProvider.GetRequiredService<IResourceManager>();
-    }
+	public static void ConfigureServices(IServiceProvider serviceProvider)
+	{
+		_logger = serviceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("PacketClientIsReadyHandler");
+		_resourceManager = serviceProvider.GetRequiredService<IResourceManager>();
+		MinigameDiagnosticsLog.ConfigureServices(serviceProvider);
+	}
 
-    public static bool HandlePacket(GatewayConnection connection)
-    {
-        _logger.LogTrace("Received {name} packet.", nameof(PacketClientIsReady));
-
-        connection.Player.Zone.OnClientIsReady(connection.Player);
-
-        return true;
-    }
+	public static bool HandlePacket(GatewayConnection connection)
+	{
+		_logger.LogInformation("PacketClientIsReady. Player={player}", connection.Player?.Guid ?? 0);
+		connection.Player.Zone.OnClientIsReady(connection.Player);
+		PacketReadyActivityDefinitions.SendStartupDefinitionsIfEnabled(connection, _logger);
+		return true;
+	}
 }
