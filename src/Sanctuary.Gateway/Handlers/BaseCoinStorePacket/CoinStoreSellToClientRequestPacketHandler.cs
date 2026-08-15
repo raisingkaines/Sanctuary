@@ -10,6 +10,7 @@ using Sanctuary.Core.IO;
 using Sanctuary.Database;
 using Sanctuary.Database.Entities;
 using Sanctuary.Game;
+using Sanctuary.Gateway.Admin;
 using Sanctuary.Packet;
 using Sanctuary.Packet.Common;
 using Sanctuary.Packet.Common.Attributes;
@@ -61,9 +62,7 @@ public static class CoinStoreSellToClientRequestPacketHandler
             return true;
         }
 
-        // TODO: Implement other item types
-        if (clientItemDefinition.Type != 1 &&
-            clientItemDefinition.Type != 12)
+        if (!StoreInventoryPurchasePolicy.IsSupported(clientItemDefinition))
         {
             coinStoreTransactionCompletePacket.Result = 8;
 
@@ -77,6 +76,19 @@ public static class CoinStoreSellToClientRequestPacketHandler
             : clientItemDefinition.GetMemberPurchasePrice();
 
         var totalCost = cost * packet.Quantity;
+        var isHousingFixture = HouseOwnershipService.IsFixtureInventoryItem(clientItemDefinition);
+        var itemTintId = packet.ItemRecord.Tint;
+        if (isHousingFixture)
+        {
+            itemTintId = HouseOwnershipService.ResolveItemTintId(
+                _resourceManager,
+                clientItemDefinition.Id,
+                itemTintId);
+        }
+        else if (!clientItemDefinition.IsTintable)
+        {
+            itemTintId = clientItemDefinition.Icon.TintId;
+        }
 
         if (connection.Player.Coins < totalCost)
         {
@@ -87,11 +99,6 @@ public static class CoinStoreSellToClientRequestPacketHandler
             return true;
         }
 
-        var tint = packet.ItemRecord.Tint;
-
-        if (!clientItemDefinition.IsTintable)
-            tint = clientItemDefinition.Icon.TintId;
-
         using var dbContext = _dbContextFactory.CreateDbContext();
 
         var dbQuery = dbContext.Characters
@@ -99,8 +106,8 @@ public static class CoinStoreSellToClientRequestPacketHandler
             .Select(x => new
             {
                 Character = x,
-                Item = x.Items.SingleOrDefault(i => i.Definition == clientItemDefinition.Id && i.Tint == tint),
-                NextId = x.Items.Max(i => i.Id)
+                Item = x.Items.SingleOrDefault(i => i.Definition == clientItemDefinition.Id && i.Tint == itemTintId),
+                NextId = x.Items.Select(i => (int?)i.Id).Max() ?? 0
             })
             .SingleOrDefault();
 
@@ -117,7 +124,6 @@ public static class CoinStoreSellToClientRequestPacketHandler
 
         if (dbItem is not null)
         {
-            dbItem.Tint = tint;
             dbItem.Count += packet.Quantity;
         }
         else
@@ -126,7 +132,7 @@ public static class CoinStoreSellToClientRequestPacketHandler
             {
                 Id = dbQuery.NextId + 1,
                 Definition = clientItemDefinition.Id,
-                Tint = tint,
+                Tint = itemTintId,
 
                 Count = packet.Quantity
             };
@@ -145,13 +151,13 @@ public static class CoinStoreSellToClientRequestPacketHandler
             return true;
         }
 
-        var clientItem = connection.Player.Items.SingleOrDefault(x => x.Definition == clientItemDefinition.Id && x.Tint == tint);
+        var clientItem = connection.Player.Items.SingleOrDefault(x =>
+            x.Definition == clientItemDefinition.Id && x.Tint == itemTintId);
 
         var addItem = false;
 
         if (clientItem is not null)
         {
-            clientItem.Tint = dbItem.Tint;
             clientItem.Count = dbItem.Count;
         }
         else
@@ -202,6 +208,15 @@ public static class CoinStoreSellToClientRequestPacketHandler
         };
 
         connection.SendTunneled(clientUpdatePacketCoinCount);
+
+        if (connection.Player.CurrentHouseGuid != 0)
+        {
+            var activeHouse = HouseOwnershipService.TryGetHouse(
+                dbContext,
+                connection.Player.CurrentHouseGuid);
+            if (activeHouse is not null && activeHouse.CharacterId == dbQuery.Character.Id)
+                HouseOwnershipService.SendFixtureItemList(connection, activeHouse, _resourceManager);
+        }
 
         coinStoreTransactionCompletePacket.Result = 1;
 
