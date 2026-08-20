@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 
 using Sanctuary.Core.Helpers;
 using Sanctuary.Database;
@@ -18,15 +19,18 @@ public sealed class HouseManager : IHouseManager
     private readonly IResourceManager _resourceManager;
     private readonly IZoneManager _zoneManager;
     private readonly IDbContextFactory<DatabaseContext> _dbContextFactory;
+    private readonly ILogger<HouseManager> _logger;
 
     public HouseManager(
         IResourceManager resourceManager,
         IZoneManager zoneManager,
-        IDbContextFactory<DatabaseContext> dbContextFactory)
+        IDbContextFactory<DatabaseContext> dbContextFactory,
+        ILogger<HouseManager> logger)
     {
         _resourceManager = resourceManager;
         _zoneManager = zoneManager;
         _dbContextFactory = dbContextFactory;
+        _logger = logger;
     }
 
     public IReadOnlyList<DbHouse> GetOwnedHouses(ulong characterId)
@@ -128,8 +132,12 @@ public sealed class HouseManager : IHouseManager
 
         var playerId = GuidHelper.GetPlayerId(player.Guid);
 
-        if (playerId != house.CharacterId &&
-            !player.Friends.Any(friend => friend.Guid == GuidHelper.GetPlayerGuid(house.CharacterId)))
+        var isOwner = playerId == house.CharacterId;
+        var isFriend = player.Friends.Any(friend => friend.Guid == GuidHelper.GetPlayerGuid(house.CharacterId));
+
+        if (!isOwner &&
+            ((house.IsMembersOnly && player.MembershipStatus == 0) ||
+                (!isFriend && (!house.IsPublished || house.IsLocked))))
         {
             return EnterHouseResult.NotAuthorized;
         }
@@ -142,9 +150,26 @@ public sealed class HouseManager : IHouseManager
             return EnterHouseResult.ZoneUnavailable;
         }
 
-        return player.TeleportToZone(zone, zone.SpawnPosition, zone.SpawnRotation)
-            ? EnterHouseResult.Success
-            : EnterHouseResult.TransferFailed;
+        if (!player.TeleportToZone(zone, zone.SpawnPosition, zone.SpawnRotation))
+            return EnterHouseResult.TransferFailed;
+
+        UpdateLastVisited(house.Id);
+        return EnterHouseResult.Success;
+    }
+
+    private void UpdateLastVisited(ulong houseId)
+    {
+        try
+        {
+            using var dbContext = _dbContextFactory.CreateDbContext();
+            dbContext.Houses
+                .Where(house => house.Id == houseId)
+                .ExecuteUpdate(setters => setters.SetProperty(house => house.LastVisited, DateTimeOffset.UtcNow));
+        }
+        catch (Exception exception)
+        {
+            _logger.LogWarning(exception, "Failed to update the last visit for house {HouseId}.", houseId);
+        }
     }
 
     private bool IsAvailableHouse(int zoneDefinitionId)
