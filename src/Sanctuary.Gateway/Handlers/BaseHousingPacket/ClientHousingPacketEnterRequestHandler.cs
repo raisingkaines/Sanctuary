@@ -34,12 +34,6 @@ public static class ClientHousingPacketEnterRequestHandler
 
         _logger.LogTrace("Received {name} packet. ( {packet} )", nameof(ClientHousingPacketEnterRequest), packet);
 
-        if (packet.Unknown != 0)
-        {
-            ChatHelper.SendSystemMessage(connection.Player, "House previews are not available yet.");
-            return true;
-        }
-
         var result = _houseManager.EnterHouse(connection.Player, packet.HouseGuid);
 
         if (result != EnterHouseResult.Success)
