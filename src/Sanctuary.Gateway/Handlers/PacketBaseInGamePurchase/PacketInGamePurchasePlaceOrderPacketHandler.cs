@@ -1,8 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Data;
 using System.Linq;
 
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
@@ -12,6 +14,7 @@ using Sanctuary.Database;
 using Sanctuary.Database.Entities;
 using Sanctuary.Game;
 using Sanctuary.Game.Resources.Definitions.Zones;
+using Sanctuary.Game.Zones;
 using Sanctuary.Packet;
 using Sanctuary.Packet.Common;
 using Sanctuary.Packet.Common.Attributes;
@@ -48,7 +51,7 @@ public static class PacketInGamePurchasePlaceOrderPacketHandler
 
         var orderDetail = packet.Order.Details.FirstOrDefault();
 
-        if (orderDetail is null)
+        if (orderDetail is null || orderDetail.Quantity <= 0)
         {
             packetInGamePurchasePlaceOrderResponse.Result = 2;
 
@@ -106,12 +109,6 @@ public static class PacketInGamePurchasePlaceOrderPacketHandler
             return true;
         }
 
-        var cost = connection.Player.MembershipStatus == 0
-            ? appStoreBundleDefinition.Price
-            : appStoreBundleDefinition.MemberDiscount;
-
-        var totalCost = cost * orderDetail.Quantity;
-
         if (housingZoneDefinition is not null)
         {
             var houseCost = connection.Player.MembershipStatus == 0
@@ -125,6 +122,27 @@ public static class PacketInGamePurchasePlaceOrderPacketHandler
                 houseCost,
                 packetInGamePurchasePlaceOrderResponse);
         }
+
+        var containsHousingInventory = appStoreBundleDefinition.Entries.Any(entry =>
+            _resourceManager.ClientItemDefinitions.TryGetValue(entry.MarketingItemId, out var definition) &&
+            StoreInventoryPurchasePolicy.IsHousingInventoryItem(definition));
+        var cost = connection.Player.MembershipStatus == 0
+            ? appStoreBundleDefinition.Price
+            : containsHousingInventory
+                ? appStoreBundleDefinition.MembersOnlyPrice
+                : appStoreBundleDefinition.MemberDiscount;
+
+        var totalCostValue = (long)cost * orderDetail.Quantity;
+        if (cost < 0 || totalCostValue > int.MaxValue)
+        {
+            packetInGamePurchasePlaceOrderResponse.Result = 2;
+
+            connection.SendTunneled(packetInGamePurchasePlaceOrderResponse);
+
+            return true;
+        }
+
+        var totalCost = (int)totalCostValue;
 
         if (connection.Player.StationCash < totalCost)
         {
@@ -156,9 +174,20 @@ public static class PacketInGamePurchasePlaceOrderPacketHandler
         var lastMountId = dbCharacter.Mounts.Count > 0 ? dbCharacter.Mounts.Max(x => x.Id) : 0;
 
         var pendingUpdates = new List<Action>();
+        var purchasedHousingInventory = false;
 
         foreach (var bundleEntry in appStoreBundleDefinition.Entries)
         {
+            var totalQuantityValue = (long)orderDetail.Quantity * bundleEntry.Quantity;
+            if (bundleEntry.Quantity <= 0 || totalQuantityValue > int.MaxValue)
+            {
+                packetInGamePurchasePlaceOrderResponse.Result = 2;
+
+                connection.SendTunneled(packetInGamePurchasePlaceOrderResponse);
+
+                return true;
+            }
+
             if (!_resourceManager.ClientItemDefinitions.TryGetValue(bundleEntry.MarketingItemId, out var clientItemDefinition))
             {
                 packetInGamePurchasePlaceOrderResponse.Result = 2;
@@ -168,24 +197,46 @@ public static class PacketInGamePurchasePlaceOrderPacketHandler
                 return true;
             }
 
-            if (clientItemDefinition.Type == 1 || clientItemDefinition.Type == 12)
+            if (StoreInventoryPurchasePolicy.IsSupported(clientItemDefinition))
             {
-                var totalQuantity = orderDetail.Quantity * bundleEntry.Quantity;
+                var totalQuantity = (int)totalQuantityValue;
+                var isHousingInventory = StoreInventoryPurchasePolicy.IsHousingInventoryItem(clientItemDefinition);
+                var itemTint = isHousingInventory
+                    ? StoreInventoryPurchasePolicy.ResolveHousingTint(clientItemDefinition, orderDetailTint)
+                    : orderDetailTint;
 
                 var dbItem = dbCharacter.Items.SingleOrDefault(i =>
-                    i.Definition == clientItemDefinition.Id && i.Tint == orderDetailTint);
+                    i.Definition == clientItemDefinition.Id && i.Tint == itemTint);
 
                 if (dbItem is not null)
                 {
+                    if (dbItem.Count < 0 || dbItem.Count > int.MaxValue - totalQuantity)
+                    {
+                        packetInGamePurchasePlaceOrderResponse.Result = 2;
+
+                        connection.SendTunneled(packetInGamePurchasePlaceOrderResponse);
+
+                        return true;
+                    }
+
                     dbItem.Count += totalQuantity;
                 }
                 else
                 {
+                    if (lastItemId == int.MaxValue)
+                    {
+                        packetInGamePurchasePlaceOrderResponse.Result = 2;
+
+                        connection.SendTunneled(packetInGamePurchasePlaceOrderResponse);
+
+                        return true;
+                    }
+
                     dbItem = new DbItem
                     {
                         Id = ++lastItemId,
                         Definition = clientItemDefinition.Id,
-                        Tint = orderDetailTint,
+                        Tint = itemTint,
 
                         Count = totalQuantity
                     };
@@ -195,10 +246,12 @@ public static class PacketInGamePurchasePlaceOrderPacketHandler
 
                 var itemDefinition = clientItemDefinition;
                 var savedItem = dbItem;
+                purchasedHousingInventory |= isHousingInventory;
 
                 pendingUpdates.Add(() =>
                 {
-                    var clientItem = connection.Player.Items.SingleOrDefault(x => x.Definition == itemDefinition.Id && x.Tint == orderDetailTint);
+                    var clientItem = connection.Player.Items.SingleOrDefault(x =>
+                        x.Definition == itemDefinition.Id && x.Tint == savedItem.Tint);
 
                     var addItem = false;
 
@@ -249,6 +302,15 @@ public static class PacketInGamePurchasePlaceOrderPacketHandler
             }
             else if (clientItemDefinition.Type == 19) // Mounts
             {
+                if (lastMountId == int.MaxValue)
+                {
+                    packetInGamePurchasePlaceOrderResponse.Result = 2;
+
+                    connection.SendTunneled(packetInGamePurchasePlaceOrderResponse);
+
+                    return true;
+                }
+
                 if (!_resourceManager.Mounts.TryGetValue(clientItemDefinition.Param1, out var mountDefinition))
                 {
                     packetInGamePurchasePlaceOrderResponse.Result = 2;
@@ -318,6 +380,15 @@ public static class PacketInGamePurchasePlaceOrderPacketHandler
             }
         }
 
+        if (dbCharacter.StationCash < totalCost)
+        {
+            packetInGamePurchasePlaceOrderResponse.Result = 5;
+
+            connection.SendTunneled(packetInGamePurchasePlaceOrderResponse);
+
+            return true;
+        }
+
         dbCharacter.StationCash -= totalCost;
 
         if (dbContext.SaveChanges() <= 0)
@@ -333,6 +404,13 @@ public static class PacketInGamePurchasePlaceOrderPacketHandler
 
         foreach (var pendingUpdate in pendingUpdates)
             pendingUpdate();
+
+        if (purchasedHousingInventory &&
+            connection.Player.Zone is HousingZone housingZone &&
+            housingZone.OwnerId == GuidHelper.GetPlayerId(connection.Player.Guid))
+        {
+            housingZone.Runtime.RefreshFixtureItemList(connection.Player);
+        }
 
         packetInGamePurchasePlaceOrderResponse.Result = 1;
 
@@ -369,49 +447,71 @@ public static class PacketInGamePurchasePlaceOrderPacketHandler
 
         try
         {
-            result = strategy.Execute(() =>
-            {
-                using var dbContext = _dbContextFactory.CreateDbContext();
-                using var transaction = dbContext.Database.BeginTransaction();
+            strategy.ExecuteInTransaction(
+                () =>
+                {
+                    strategyContext.ChangeTracker.Clear();
 
-                if (dbContext.Houses.Any(house =>
+                    if (strategyContext.Houses.Any(house =>
+                            house.CharacterId == characterId &&
+                            house.ZoneDefinitionId == housingZoneDefinition.Id))
+                    {
+                        result = 2;
+                        return;
+                    }
+
+                    var updated = strategyContext.Characters
+                        .Where(character =>
+                            character.Id == characterId &&
+                            character.StationCash >= totalCost)
+                        .ExecuteUpdate(setters => setters.SetProperty(
+                            character => character.StationCash,
+                            character => character.StationCash - totalCost));
+
+                    if (updated != 1)
+                    {
+                        result = strategyContext.Characters.Any(character => character.Id == characterId) ? 5 : 2;
+                        return;
+                    }
+
+                    strategyContext.Houses.Add(new DbHouse
+                    {
+                        CharacterId = characterId,
+                        ZoneDefinitionId = housingZoneDefinition.Id
+                    });
+
+                    if (strategyContext.SaveChanges() <= 0)
+                    {
+                        result = 2;
+                        return;
+                    }
+
+                    result = 1;
+                },
+                () =>
+                {
+                    if (result != 1)
+                        return false;
+
+                    using var verificationContext = _dbContextFactory.CreateDbContext();
+                    return verificationContext.Houses.AsNoTracking().Any(house =>
                         house.CharacterId == characterId &&
-                        house.ZoneDefinitionId == housingZoneDefinition.Id))
-                {
-                    return 2;
-                }
+                        house.ZoneDefinitionId == housingZoneDefinition.Id);
+                },
+                IsolationLevel.Serializable);
 
-                var updated = dbContext.Characters
-                    .Where(character =>
-                        character.Id == characterId &&
-                        character.StationCash >= totalCost)
-                    .ExecuteUpdate(setters => setters.SetProperty(
-                        character => character.StationCash,
-                        character => character.StationCash - totalCost));
-
-                if (updated != 1)
-                    return dbContext.Characters.Any(character => character.Id == characterId) ? 5 : 2;
-
-                dbContext.Houses.Add(new DbHouse
-                {
-                    CharacterId = characterId,
-                    ZoneDefinitionId = housingZoneDefinition.Id
-                });
-
-                if (dbContext.SaveChanges() <= 0)
-                    return 2;
-
-                stationCash = dbContext.Characters
+            if (result == 1)
+            {
+                using var resultContext = _dbContextFactory.CreateDbContext();
+                stationCash = resultContext.Characters
                     .Where(character => character.Id == characterId)
                     .Select(character => character.StationCash)
                     .Single();
-
-                transaction.Commit();
-                return 1;
-            });
+            }
         }
-        catch (DbUpdateException)
+        catch (Exception exception) when (exception is DbUpdateException or RetryLimitExceededException)
         {
+            _logger.LogWarning(exception, "Unable to purchase house {ZoneDefinitionId} for character {CharacterId}.", housingZoneDefinition.Id, characterId);
             result = 2;
         }
 
